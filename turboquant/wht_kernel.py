@@ -95,6 +95,12 @@ def _wht_kernel(
     for s in range(LOG2_D):
         # Write current x to global memory so the next tl.load sees updated values
         tl.store(X_ptr + base + offs, x)
+        # Barrier is required when d spans more than one warp (d > 32 for fp32
+        # on CUDA): without it, a lane in warp B may read its partner in warp A
+        # before warp A's tl.store has become visible, giving stale data and a
+        # corrupted butterfly.  Intra-warp dependencies don't need the barrier,
+        # which is why d=64 happened to work without it.
+        tl.debug_barrier()
 
         h = 1 << s              # partner distance at this stage
 
@@ -107,17 +113,21 @@ def _wht_kernel(
         x_self    = tl.load(X_ptr + base + offs)
         x_partner = tl.load(X_ptr + base + partner_offs)
 
-        # Butterfly: left lane gets (a+b), right lane gets (a-b)
+        # Butterfly: left lane (i) gets x[i]+x[i^h], right lane (i^h) gets
+        # x[i]-x[i^h]. From a right lane's perspective, x_self is x[i^h] and
+        # x_partner is x[i], so the right result is (partner - self).
         a = x_self
         b = x_partner
 
         x_new_left  = a + b
-        x_new_right = a - b
+        x_new_right = b - a
 
         x = tl.where(left_mask, x_new_left, x_new_right)
 
     # ── Normalize by 1/sqrt(d) ────────────────────────────────────────────────
-    scale = 1.0 / tl.sqrt(d.to(tl.float32))
+    # d is a tl.constexpr (Python int), so the scale is a compile-time float
+    # that Triton broadcasts across the tile.
+    scale = 1.0 / (float(d) ** 0.5)
     x = x * scale
 
     # Store result back
