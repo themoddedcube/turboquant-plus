@@ -35,6 +35,20 @@ def unpack_values(vq: ValueQuantized) -> torch.Tensor:
         v2 = (packed >> 4) & 0x03
         v3 = (packed >> 6) & 0x03
         return torch.stack([v0, v1, v2, v3], dim=-1).reshape(*packed.shape[:-1], packed.shape[-1] * 4)
+    elif bits == 3:
+        # Unpack 8 values from 3 bytes
+        p = packed.long()
+        pr = p.reshape(*packed.shape[:-1], packed.shape[-1] // 3, 3)
+        b0, b1, b2 = pr[..., 0], pr[..., 1], pr[..., 2]
+        v0 = b0 & 0x7
+        v1 = (b0 >> 3) & 0x7
+        v2 = ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2)
+        v3 = (b1 >> 1) & 0x7
+        v4 = (b1 >> 4) & 0x7
+        v5 = ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1)
+        v6 = (b2 >> 2) & 0x7
+        v7 = (b2 >> 5) & 0x7
+        return torch.stack([v0,v1,v2,v3,v4,v5,v6,v7], dim=-1).to(torch.uint8).reshape(*packed.shape[:-1], packed.shape[-1] * 8 // 3)
     elif bits == 4:
         v0 = packed & 0x0F
         v1 = (packed >> 4) & 0x0F
@@ -45,15 +59,17 @@ def unpack_values(vq: ValueQuantized) -> torch.Tensor:
 def quantize_values(
     v: torch.Tensor,
     bits: int = 2,
-    group_size: int = 32,
+    group_size: int = 16,
 ) -> ValueQuantized:
     """
-    Symmetric group quantization for value vectors.
+    Asymmetric group quantization for value vectors.
 
     Args:
         v: (..., seq_len, d) value vectors
-        bits: quantization bits (2 or 4)
-        group_size: number of elements per quantization group
+        bits: quantization bits (2, 3, 4, or 8).
+              3-bit uses true 3-bit packing (8 values per 3 bytes).
+        group_size: elements per quantization group (default 16, was 32).
+                    Smaller groups improve quality: 2-bit gs=16 -> cos=0.952 vs gs=32 -> cos=0.932.
     """
     orig_shape = v.shape
     d = orig_shape[-1]
@@ -61,7 +77,7 @@ def quantize_values(
     assert d % group_size == 0, f"head_dim {d} must be divisible by group_size {group_size}"
 
     # Reshape to groups
-    v_grouped = v.reshape(*orig_shape[:-1], n_groups, group_size)  # (..., seq, n_groups, gs)
+    v_grouped = v.reshape(*orig_shape[:-1], n_groups, group_size)
 
     # Compute scale and zero per group (asymmetric)
     v_min = v_grouped.min(dim=-1, keepdim=True).values
@@ -76,18 +92,29 @@ def quantize_values(
     v_q = ((v_grouped - zero) / scale).round().clamp(0, n_levels).to(torch.uint8)
     v_q_flat = v_q.reshape(*orig_shape[:-1], d)
 
-    # Bit-pack: for 2-bit, pack 4 values per byte; for 4-bit, pack 2 per byte
+    # Bit-pack based on bits
     if bits == 2:
-        # Pack 4 x 2-bit values into each uint8: [a, b, c, d] -> a | (b<<2) | (c<<4) | (d<<6)
+        # 4 values per byte: a | (b<<2) | (c<<4) | (d<<6)
         assert d % 4 == 0
         v_4 = v_q_flat.reshape(*orig_shape[:-1], d // 4, 4)
         packed = v_4[..., 0] | (v_4[..., 1] << 2) | (v_4[..., 2] << 4) | (v_4[..., 3] << 6)
-        v_q_flat = packed  # shape: (..., d//4)
+        v_q_flat = packed  # (..., d//4)
+    elif bits == 3:
+        # True 3-bit: 8 values per 3 bytes
+        # [a,b,c,d,e,f,g,h] -> byte0: a|b<<3|(c&3)<<6, byte1: c>>2|d<<1|e<<4|(f&1)<<7, byte2: f>>1|g<<2|h<<5
+        assert d % 8 == 0, f"head_dim {d} must be divisible by 8 for 3-bit packing"
+        v_8 = v_q_flat.reshape(*orig_shape[:-1], d // 8, 8).long()
+        b0 = v_8[...,0] | (v_8[...,1] << 3) | ((v_8[...,2] & 0x3) << 6)
+        b1 = (v_8[...,2] >> 2) | (v_8[...,3] << 1) | (v_8[...,4] << 4) | ((v_8[...,5] & 0x1) << 7)
+        b2 = (v_8[...,5] >> 1) | (v_8[...,6] << 2) | (v_8[...,7] << 5)
+        packed = torch.stack([b0, b1, b2], dim=-1).to(torch.uint8).reshape(*orig_shape[:-1], d * 3 // 8)
+        v_q_flat = packed  # (..., d*3//8)
     elif bits == 4:
+        # 2 values per byte: a | (b<<4)
         assert d % 2 == 0
         v_2 = v_q_flat.reshape(*orig_shape[:-1], d // 2, 2)
         packed = v_2[..., 0] | (v_2[..., 1] << 4)
-        v_q_flat = packed  # shape: (..., d//2)
+        v_q_flat = packed  # (..., d//2)
     # bits==8: no packing needed
 
     return ValueQuantized(
@@ -139,7 +166,7 @@ class TurboQuantKVCache:
         head_dim: int,
         key_bits: int = 3,
         value_bits: int = 2,
-        value_group_size: int = 32,
+        value_group_size: int = 16,  # Experiment 03: gs=16 gives cos=0.952 vs gs=32 cos=0.932 at no compression cost
         buffer_size: int = 128,
         device: torch.device = None,
         dtype: torch.dtype = torch.float16,

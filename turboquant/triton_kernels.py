@@ -548,9 +548,13 @@ def turboquant_fused_decode(
     v_scales = value_quantized.scales
     v_zeros = value_quantized.zeros
 
-    # Unpack bit-packed values if needed (2-bit: 4 vals/byte, 4-bit: 2 vals/byte)
+    # Unpack bit-packed values if needed (2-bit: 4 vals/byte, 3-bit: 8 vals/3 bytes, 4-bit: 2 vals/byte)
     v_bits = value_quantized.bits if len(value_quantized) > 3 else 2
     if v_bits == 2 and v_data.shape[-1] != D:
+        from turboquant.kv_cache import unpack_values
+        v_data = unpack_values(value_quantized)
+        # v_data is now (..., N, D) uint8
+    elif v_bits == 3 and v_data.shape[-1] != D:
         from turboquant.kv_cache import unpack_values
         v_data = unpack_values(value_quantized)
         # v_data is now (..., N, D) uint8
