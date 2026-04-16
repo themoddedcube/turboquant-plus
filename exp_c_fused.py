@@ -32,7 +32,19 @@ def hybrid_decode(query, pq_r, vq, q_prod, sm_scale, gs=32):
 print("=== Kernel 3: turboquant_fused_decode ===\n")
 print("── Correctness ──\n")
 
-for (BH, N, D) in [(8, 256, 128), (16, 1024, 128), (16, 1024, 256), (32, 4096, 128)]:
+# Sweep both 2-bit and 3-bit value paths; 3-bit was added in Experiment 07 and
+# requires the unpack_values bits==3 branch in kv_cache.py.
+for (BH, N, D, vbits, gs) in [
+    (8,   256, 128, 2, 32),
+    (16, 1024, 128, 2, 32),
+    (16, 1024, 256, 2, 32),
+    (32, 4096, 128, 2, 32),
+    (8,   256, 128, 3, 32),
+    (16, 1024, 128, 3, 32),
+    (16, 1024, 128, 3, 16),
+    (16, 1024, 256, 3, 32),
+    (32, 4096, 128, 3, 32),
+]:
     q_prod = TurboQuantProd(dim=D, bits=3, device=device)
     keys   = torch.randn(BH * N, D, device=device)
     values = torch.randn(BH, N, D, device=device, dtype=torch.float16)
@@ -46,23 +58,23 @@ for (BH, N, D) in [(8, 256, 128), (16, 1024, 128), (16, 1024, 256), (32, 4096, 1
         'residual_norms': pq.residual_norms.reshape(BH,N),
         'norms':       pq.norms.reshape(BH,N),
         'mse_bits':    pq.mse_bits})()
-    vq = quantize_values(values, bits=2, group_size=32)
+    vq = quantize_values(values, bits=vbits, group_size=gs)
 
     # Reference: hybrid
-    out_ref = hybrid_decode(query.unsqueeze(1), pq_r, vq, q_prod, sm_scale).squeeze(1)
+    out_ref = hybrid_decode(query.unsqueeze(1), pq_r, vq, q_prod, sm_scale, gs).squeeze(1)
 
     try:
         out_fused = turboquant_fused_decode(
             query, pq_r, vq,
             q_prod.mse_quantizer.Pi, q_prod.S,
             q_prod.mse_quantizer.centroids,
-            pq.mse_bits, q_prod.qjl_scale, sm_scale, group_size=32)
+            pq.mse_bits, q_prod.qjl_scale, sm_scale, group_size=gs)
         max_err = (out_fused.float() - out_ref.float()).abs().max().item()
         cos = F.cosine_similarity(out_fused.float(), out_ref.float(), dim=-1).mean().item()
         status = "PASS" if max_err < 0.05 else ("~OK" if max_err < 0.5 else "FAIL")
-        print(f"  BH={BH:2d} N={N:5d} D={D}  max_err={max_err:.5f}  cos={cos:.6f}  {status}")
+        print(f"  BH={BH:2d} N={N:5d} D={D} vbits={vbits} gs={gs}  max_err={max_err:.5f}  cos={cos:.6f}  {status}")
     except Exception as e:
-        print(f"  BH={BH:2d} N={N:5d} D={D}  FUSED FAILED: {e}")
+        print(f"  BH={BH:2d} N={N:5d} D={D} vbits={vbits} gs={gs}  FUSED FAILED: {e}")
 
 print("\n── Throughput: 3-way comparison (BH=32, D=128) ──\n")
 print(f"  {'N':>6}  {'FP16_ms':>8}  {'Hybrid_ms':>10}  {'Fused_ms':>9}  {'Hybrid/FP16':>12}  {'Fused/FP16':>11}")

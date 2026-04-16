@@ -35,7 +35,7 @@ The Triton kernel itself (`_turboquant_fused_decode_kernel`) does not need chang
 
 ## What This Enables
 
-With this fix, the full quality improvement from 3-bit value quantization (cosine similarity 0.987 vs 0.932 for 2-bit) now flows through the GPU fast path:
+With this fix, the full quality improvement from 3-bit value quantization (cosine similarity 0.986 vs 0.932 for 2-bit) now flows through the GPU fast path:
 
 - `quantize_values(v, bits=3)` → stores 48 B/token for D=128 ✓  
 - `unpack_values(vq)` → produces (N, 128) uint8 in `{0..7}` ✓  
@@ -58,11 +58,11 @@ vq = quantize_values(v.squeeze(0), bits=3, group_size=32)
 print(f"packed shape: {vq.data.shape}")  # expect (64, 48) for D=128
 v_hat = dequantize_values(vq, group_size=32)
 cos = F.cosine_similarity(v.squeeze(0), v_hat).mean()
-print(f"cosine similarity: {cos:.4f}")  # expect ~0.987
+print(f"cosine similarity: {cos:.4f}")  # expect ~0.986
 ```
 
 ## Status
 
 - [x] Fix applied to `turboquant/triton_kernels.py` (line 551-562)
-- [ ] GPU validation with full `turboquant_fused_decode` call (requires Brev GPU)
-- [ ] Update fused kernel benchmark (Experiment 05) to include 3-bit value config
+- [x] GPU validation with full `turboquant_fused_decode` call (5 configs, max_err=0.0, cos=1.0 vs hybrid reference on RTX A4000, 2026-04-16)
+- [x] `exp_c_fused.py` correctness sweep extended to include 3-bit value configs

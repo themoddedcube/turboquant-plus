@@ -45,7 +45,7 @@
 %% Farquhar 5-sentence formula:
 %% 1. What you achieved  2. Why hard/important  3. How  4. Evidence  5. Remarkable number
 
-We demonstrate that two targeted changes to TurboQuant's value quantization—halving the group size and adopting true 3-bit packing—raise per-token cosine fidelity from 0.932 to 0.987 while preserving or improving compression ratios.
+We demonstrate that two targeted changes to TurboQuant's value quantization—halving the group size and adopting true 3-bit packing—raise per-token cosine fidelity from 0.932 to 0.986 while preserving or improving compression ratios.
 KV cache memory grows linearly with context length and is the primary bottleneck for long-context LLM inference; existing compressed attention methods either sacrifice quality (2-bit) or waste storage (naive 3-bit rounded to 4-bit).
 We implement a true 3-bit scheme (8 values per 3 bytes) in TurboQuant's value quantizer and reduce the default group size from 32 to 16, requiring only a two-line change to the open-source codebase.
 We validate all three TurboQuant Triton fused decode kernels on an NVIDIA RTX A4000, confirm numerical correctness to floating-point precision ($\text{max\_err} < 5 \times 10^{-5}$), and measure up to 60$\times$ decode speedup over PyTorch at 16k context length.
@@ -66,13 +66,13 @@ KV cache quantization achieves 2--5$\times$ compression by reducing per-token bi
 We prove that \emph{two minimal changes to TurboQuant's value quantizer jointly close this quality gap without increasing end-to-end storage cost}:
 \begin{enumerate}
 \item \textbf{Group size 32 $\to$ 16} (+0.020 cosine, zero compression cost, one-line default change).
-\item \textbf{True 3-bit packing} (8 values per 3 bytes, cosine 0.987 vs 0.932 at the same 64 B/token budget).
+\item \textbf{True 3-bit packing} (8 values per 3 bytes, cosine 0.986 vs 0.932 at the same 64 B/token budget).
 \end{enumerate}
 
 \noindent\textbf{Contributions:}
 \begin{enumerate}
 \item \textbf{Group size analysis (C1)}: Systematic sweep showing group\_size=16 as the dominant free improvement, with diminishing returns below group\_size=8. Verified on GPU.
-\item \textbf{True 3-bit packing (C2)}: Design and implementation of a lossless 8-values-per-3-bytes packing scheme. Cosine similarity 0.987, approaching 4-bit quality (0.997) at near-2-bit storage.
+\item \textbf{True 3-bit packing (C2)}: Design and implementation of a lossless 8-values-per-3-bytes packing scheme. Cosine similarity 0.986, approaching 4-bit quality (0.997) at near-2-bit storage.
 \item \textbf{Triton kernel validation (C3)}: First independent GPU validation of all three TurboQuant Triton kernels. Confirmed correct to floating-point precision; 20--60$\times$ decode speedup over PyTorch at 4k--16k context.
 \item \textbf{RHT quality equivalence (C4)}: Empirical proof that the Randomized Hadamard Transform is quality-identical to QR rotation ($<$0.001 cosine difference) at 102$\times$ less memory for $d=128$. Triton WHT kernel implemented to make RHT production-viable.
 \item \textbf{Context capacity analysis (C5)}: 3.88$\times$ context extension over FP16 on the RTX A4000, enabling 2.39M tokens per 16.8 GB GPU.
@@ -158,7 +158,7 @@ Standard 3-bit quantization is typically implemented as 4-bit-aligned storage (t
 
 This is lossless (zero round-trip error). The packed representation requires $d \times 3 / 8$ bytes per token vs $d / 2$ bytes for 4-bit-aligned 3-bit storage—a 25\% reduction in packed data size. Combined with the metadata, total bytes for $d=128$, $G=32$ are 64 B/token ($=$ 4.00$\times$ compression), identical in budget to 2-bit with $G=16$.
 
-The improvement in quality at equal bytes-per-token is the core result: 3-bit $G=32$ at 64 B/token achieves cosine similarity 0.987 vs 0.952 for 2-bit $G=16$—a $+0.035$ improvement at no storage cost increase.
+The improvement in quality at equal bytes-per-token is the core result: 3-bit $G=32$ at 64 B/token achieves cosine similarity 0.986 vs 0.952 for 2-bit $G=16$—a $+0.034$ improvement at no storage cost increase.
 
 \subsection{Kernel 3 Extension}
 The fused decode Triton kernel (Kernel 3) internally calls \texttt{unpack\_values} before dequantization. We extend the dispatch logic to handle \texttt{bits=3}, routing to the 3-bit unpack path (8 values per 3 bytes). The Triton kernel itself does not change—it processes unpacked uint8 integers and applies scale/zero-point dequantization identically regardless of source bit-width.
@@ -210,7 +210,7 @@ Storage: sign vector $\bm{r}$ (int8, $d$ bytes) + permutation $\bm{\pi}$ (int32,
 2 & 16 & 0.952 & 64 & \textbf{+0.020 free} (same 4.00$\times$ budget) \\
 2 & 8  & 0.971 & 96 & Diminishing returns at gs=8 \\
 \midrule
-3 & 32 & \textbf{0.987} & 64 & \textbf{New sweet spot} (same budget as 2-bit gs=16) \\
+3 & 32 & \textbf{0.986} & 64 & \textbf{New sweet spot} (same budget as 2-bit gs=16) \\
 3 & 16 & 0.990 & 80 & Near-ceiling at additional 16 B/tok \\
 \midrule
 4 & 32 & 0.997 & 80 & Near-lossless reference \\
@@ -221,7 +221,7 @@ FP16 & — & 1.000 & 256 & Baseline \\
 
 \textbf{Results} (Table~\ref{tab:main}): Reducing group size from 32 to 16 at 2-bit yields $+0.020$ cosine similarity with no change in data bits-per-token. The metadata overhead increases from 16 to 32 bytes, but both configurations fall within the same 4.00$\times$ compression tier.
 
-\textbf{Conclusion} (three-time rule applied): Group size is the dominant free lever in value quantization. At 64 B/token, the 3-bit gs=32 configuration ($\Delta = +0.035$ vs 2-bit gs=16) is Pareto-superior to any 2-bit configuration at the same budget.
+\textbf{Conclusion} (three-time rule applied): Group size is the dominant free lever in value quantization. At 64 B/token, the 3-bit gs=32 configuration ($\Delta = +0.034$ vs 2-bit gs=16) is Pareto-superior to any 2-bit configuration at the same budget.
 
 \begin{figure}[t]
 \centering
@@ -243,7 +243,7 @@ FP16 & — & 1.000 & 256 & Baseline \\
     (48, 0.932)(64, 0.952)(96, 0.971)};
 \addlegendentry{2-bit}
 \addplot[red, mark=triangle*, mark size=2.5pt, thick] coordinates {
-    (64, 0.987)(80, 0.990)};
+    (64, 0.986)(80, 0.990)};
 \addlegendentry{3-bit}
 \addplot[green!60!black, mark=diamond*, mark size=2.5pt, thick] coordinates {
     (80, 0.997)(96, 0.998)};
@@ -251,7 +251,7 @@ FP16 & — & 1.000 & 256 & Baseline \\
 \addplot[black, dashed, thick, mark=none] coordinates {(44, 1.0)(105, 1.0)};
 \addlegendentry{FP16}
 % Annotation
-\node[font=\tiny, red, above right] at (64, 0.987) {3-bit gs=32\\\textbf{+0.035}};
+\node[font=\tiny, red, above right] at (64, 0.986) {3-bit gs=32\\\textbf{+0.034}};
 \node[font=\tiny, blue, above right] at (64, 0.952) {2-bit gs=16};
 \end{axis}
 \end{tikzpicture}
@@ -279,7 +279,7 @@ FP16 & — & 1.000 & 256 & Baseline \\
 \addlegendentry{Linear (reference)}
 \end{axis}
 \end{tikzpicture}
-\caption{\textbf{Left}: Quality-compression Pareto front. At 64 B/token, 3-bit gs=32 (red, CosSim=0.987) is $+0.035$ above 2-bit gs=16 (blue, CosSim=0.952) at equal storage. The old default (2-bit gs=32, 48 B/tok) is Pareto-dominated by 3-bit. \textbf{Right}: Triton attention scoring speedup vs PyTorch at increasing context length. Triton approaches constant-time behavior (sub-linear scaling) due to compressed key reads; 60$\times$ speedup at $N=16{,}384$.}
+\caption{\textbf{Left}: Quality-compression Pareto front. At 64 B/token, 3-bit gs=32 (red, CosSim=0.986) is $+0.034$ above 2-bit gs=16 (blue, CosSim=0.952) at equal storage. The old default (2-bit gs=32, 48 B/tok) is Pareto-dominated by 3-bit. \textbf{Right}: Triton attention scoring speedup vs PyTorch at increasing context length. Triton approaches constant-time behavior (sub-linear scaling) due to compressed key reads; 60$\times$ speedup at $N=16{,}384$.}
 \label{fig:pareto_speedup}
 \end{figure}
 
@@ -364,7 +364,7 @@ FP16              & 512 &   615k & 615k & 1.00$\times$ \\
 \end{tabular}
 \end{table}
 
-\textbf{Results} (Table~\ref{tab:capacity}): With 3-bit keys + 2-bit values (new default), a single A4000 holds 2.39 million tokens—3.88$\times$ more than FP16. The context capacity scales linearly with compression ratio, as expected. Adding 3-bit values reduces capacity to 2.13M tokens (3.45$\times$), an acceptable tradeoff when cosine fidelity 0.987 is required.
+\textbf{Results} (Table~\ref{tab:capacity}): With 3-bit keys + 2-bit values (new default), a single A4000 holds 2.39 million tokens—3.88$\times$ more than FP16. The context capacity scales linearly with compression ratio, as expected. Adding 3-bit values reduces capacity to 2.13M tokens (3.45$\times$), an acceptable tradeoff when cosine fidelity 0.986 is required.
 
 \textbf{Conclusion}: TurboQuant at default settings enables million-token inference on a consumer GPU without model changes.
 
@@ -376,7 +376,7 @@ FP16              & 512 &   615k & 615k & 1.00$\times$ \\
 \textbf{Recommended production defaults.}
 Based on our analysis, we recommend:
 (i) \textit{Immediate change}: set \texttt{value\_group\_size = 16} — one line, zero compression cost, $+0.020$ cosine.
-(ii) \textit{Quality tier}: use \texttt{value\_bits = 3, group\_size = 32} — same 64 B/token as 2-bit gs=16, but $+0.035$ additional cosine (0.987 total).
+(ii) \textit{Quality tier}: use \texttt{value\_bits = 3, group\_size = 32} — same 64 B/token as 2-bit gs=16, but $+0.034$ additional cosine (0.986 total).
 (iii) \textit{Maximum context}: 3-bit keys + 2-bit values gs=16 — 3.88$\times$ extension over FP16.
 
 \textbf{Why fused Kernel 3 is slower than FP16 at short contexts.}
@@ -408,7 +408,7 @@ GPTQ \citep{frantar2023gptq} uses group quantization for weight quantization, fi
 
 \section{Conclusion}
 
-We demonstrated that TurboQuant's 2-bit value quantization quality gap (CosSim 0.932) can be closed via two targeted changes: halving the group size from 32 to 16 (+0.020 cosine, free) and adopting true 3-bit packing (+0.055 cosine vs 2-bit default, 33\% more bytes). At equal 64 B/token storage, 3-bit values (CosSim 0.987) are strictly superior to any 2-bit configuration. We validated all three Triton fused decode kernels on a real GPU (60$\times$ speedup at 16k context) and proved the Randomized Hadamard Transform is quality-identical to QR rotation with 102$\times$ less memory. Together, these improvements enable 2.39 million token inference on a commodity RTX A4000—making million-token contexts practically viable without specialized hardware.
+We demonstrated that TurboQuant's 2-bit value quantization quality gap (CosSim 0.932) can be closed via two targeted changes: halving the group size from 32 to 16 (+0.020 cosine, free) and adopting true 3-bit packing (+0.055 cosine vs 2-bit default, 33\% more bytes). At equal 64 B/token storage, 3-bit values (CosSim 0.986) are strictly superior to any 2-bit configuration. We validated all three Triton fused decode kernels on a real GPU (60$\times$ speedup at 16k context) and proved the Randomized Hadamard Transform is quality-identical to QR rotation with 102$\times$ less memory. Together, these improvements enable 2.39 million token inference on a commodity RTX A4000—making million-token contexts practically viable without specialized hardware.
 
 % ─── Acknowledgments ────────────────────────────────────────────────────────
 
