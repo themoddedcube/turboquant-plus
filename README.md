@@ -1,220 +1,292 @@
-# TurboQuant: KV Cache Compression for LLM Inference
+# TurboQuant+
 
-Implementation of TurboQuant KV cache compression (ICLR 2026, arXiv:2504.19874) with vLLM integration. Tested on dense and MoE architectures across RTX 3090 and RTX 5090 GPUs.
+Three targeted improvements to the TurboQuant KV cache compression algorithm
+([Zandieh et al., arXiv:2504.19874](https://arxiv.org/abs/2504.19874)), with
+end-to-end GPU validation and a paper draft. Every number in this README is
+reproducible from the scripts in this repository on an NVIDIA RTX A4000.
 
-## Benchmark Results
+**Paper draft**: [`paper/turboquant_plus_v2.tex`](paper/turboquant_plus_v2.tex)
+· **Reference implementation**: [upstream TurboQuant](https://github.com/0xSero/turboquant)
+· **License**: GPL-3.0
 
-### RTX 5090 (32GB) -- Qwen3.5-27B-AWQ (dense, 4-bit weights, TP=1)
+---
 
-**Setup**: Single RTX 5090, vLLM 0.18.0, `gpu_memory_utilization=0.90`, 16 full-attention layers out of 64 total (rest are linear-attention).
+## TL;DR
 
-| Metric | Baseline (bf16 KV) | TurboQuant (3b key / 2b val) |
-|--------|-------------------|------------------------------|
-| Prefill tok/s (30k ctx) | 1,804 | 1,907 (+5.7%) |
-| Decode tok/s (30k ctx) | 1.264 | 1.303 (+3.1%) |
-| KV cache freed | -- | **30.0 GB** (across 4 GPUs) |
-| Max token capacity | 457,072 | **914,144** (2.0x) |
-| Peak activation memory | 644.6 MB | 599.2 MB (-7.0%) |
+| | TurboQuant (upstream, 2-bit gs=32) | **TurboQuant+ (3-bit gs=32)** | Delta |
+|---|---|---|---|
+| Per-token cosine similarity | 0.932 | **0.986** | **+0.054** |
+| Bytes per token (d=128, values only) | 48 B | **64 B** | +16 B |
+| Bytes per token vs 2-bit gs=16 (same quality tier) | 64 B | **64 B** | same |
+| Rotation memory (d=128, O(d²) vs O(d)) | 64 KB (QR) | **640 B (RHT)** | **102× less** |
+| WHT kernel speed vs cuBLAS dense matmul (d=128) | — | **7.67×** | — |
+| Fused decode correctness (2-bit and 3-bit values) | 2-bit only | **all 9 configs pass** (max_err = 0, cos = 1.0) | + 3-bit path |
+| Context extension vs FP16 (3-bit keys, 2-bit values) | 3.88× | **3.88×** | inherited |
 
-### 8x RTX 3090 (24GB each) -- Qwen3.5-35B-A3B MoE (pruned, 205 experts, TP=8)
+The core result: **at the same 64 B/token budget, 3-bit gs=32 reaches cos=0.986
+vs 0.952 for 2-bit gs=16** — a +0.034 quality gain with zero storage cost.
 
-**Setup**: 8x RTX 3090, vLLM 0.18.0, `gpu_memory_utilization=0.92`, AMD EPYC 7443P 24-Core, 504GB RAM. Model has 10 full-attention layers + 30 linear-attention layers (40 total). TQ compresses only the 10 full-attention layers.
+---
 
-#### Throughput & Latency (Baseline, bf16 KV)
+## What's new
 
-| Context | Prefill tok/s | Decode tok/s | TTFT (s) | Needles Found |
-|--------:|--------------:|-------------:|---------:|--------------:|
-| 1,000 | 7,127 | 129.7 | 0.14 | 4/5 |
-| 4,000 | 8,887 | 131.5 | 0.45 | 4/5 |
-| 8,000 | 9,684 | 131.1 | 0.83 | 4/5 |
-| 16,000 | 9,933 | 133.0 | 1.61 | 4/5 |
-| 32,000 | 9,761 | 116.7 | 3.28 | 4/5 |
-| 64,000 | 8,843 | 122.6 | 7.24 | 4/5 |
-| 100,000 | 8,479 | 106.8 | 11.79 | 4/5 |
-| 131,000 | 8,238 | 98.3 | 15.90 | 4/5 |
+### 1. True 3-bit value quantization
 
-- **Prefill** saturates around 10k tok/s, degrades gently to 8.2k at 131k context.
-- **Decode** drops from 133 to 98 tok/s at 131k (KV readback cost from full-attention layers).
-- **TTFT** scales linearly with context length (purely compute-bound).
-- **Needles** 4/5 found consistently at ALL context lengths -- the model reformats one answer.
+Upstream ships 2-bit and 4-bit value quantization. The natural middle — 3-bit —
+wasn't packed efficiently (naive 1-byte-per-value storage wastes 5 bits). This
+branch implements lossless 8-values-per-3-bytes packing in
+[`turboquant/kv_cache.py`](turboquant/kv_cache.py).
 
-#### VRAM Breakdown (per GPU at 131k context)
+| bits | group size | cos_sim | bytes / token (d=128) | compression vs FP16 |
+|:---:|:---:|:---:|:---:|:---:|
+| 2 | 32 | 0.9329 | 48 | 5.33× |
+| 2 | 16 | 0.9521 | 64 | 4.00× |
+| **3** | **32** | **0.9864** | **64** | **4.00×** |
+| 3 | 16 | 0.9905 | 80 | 3.20× |
+| 4 | 16 | 0.9979 | 96 | 2.67× |
 
-| Component | Size |
-|-----------|-----:|
-| Total VRAM | 24,576 MB |
-| Reserved (0.92 util) | 22,610 MB |
-| Model weights | ~6,750 MB |
-| KV cache pool | **9,035 MB** |
-| -- full_attention (10 layers) | 3,614 MB |
-| -- linear_attention (30 layers) | 5,421 MB |
-| CUDA overhead + graphs | ~6,825 MB |
+Measured by `exp_a_values.py`, d=128, N=256 Gaussian samples. At the 64 B/token
+tier, 3-bit gs=32 is Pareto-optimal.
 
-#### Baseline vs TurboQuant KV Cache
+### 2. Randomized Hadamard Transform (RHT) replaces QR rotation
 
-| Context | Baseline KV/GPU | TQ KV/GPU | Savings/GPU | Savings % |
-|--------:|----------------:|----------:|------------:|----------:|
-| 8,000 | 55.7 MB | 38.5 MB | **17.2 MB** | 30.9% |
-| 32,000 | 191.5 MB | 132.3 MB | **59.3 MB** | 30.9% |
-| 64,000 | 374.3 MB | 258.5 MB | **115.8 MB** | 30.9% |
-| 100,000 | 578.1 MB | 399.2 MB | **178.8 MB** | 30.9% |
-| 131,000 | 755.7 MB | 521.9 MB | **233.8 MB** | 30.9% |
+Upstream stores a dense `d × d` orthogonal matrix for rotation. Replacing it
+with an RHT (diagonal random signs + random permutation + Walsh-Hadamard
+Transform) gives identical quantization quality at O(d) memory.
 
-- Savings are **30.9% of total KV** because TQ only compresses the 10 full-attention layers (40% of KV).
-- The 30 linear-attention layers (60% of KV) are **not compressible** by TQ.
-- On a **pure dense transformer**, savings would be **77%** (4.4x compression).
+| Test | QR rotation | RHT | Difference |
+|---|---|---|---|
+| 2-bit cosine similarity | 0.9521 | 0.9523 | +0.0002 |
+| 3-bit cosine similarity | 0.9881 | 0.9881 | <0.0001 |
+| 4-bit cosine similarity | 0.9979 | 0.9979 | <0.0001 |
+| Memory (d=128) | 64 KB | 640 B | **102× less** |
+| Memory (d=256) | 256 KB | 1,280 B | **205× less** |
 
-#### Context Extension
+Measured by `exp_b_hadamard.py`. Full derivation and correctness proof in
+[`turboquant/wht_kernel.py`](turboquant/wht_kernel.py).
 
-| | Tokens | Multiplier |
-|---|-------:|:----------:|
-| Baseline capacity | 1,411,680 | 1.0x |
-| With TQ | 2,043,808 | **1.45x** |
+### 3. Triton WHT kernel
 
-Alternatively, freed VRAM supports **3 additional concurrent 131k-context requests**.
+The reference Python butterfly WHT is O(d log d) in FLOPs but dominated by
+Python interpreter overhead. This branch ships a Triton JIT kernel that runs
+the butterfly in-register for d ∈ {64, 128, 256, 512}.
 
-#### Coherence & Quality
+| d | Triton WHT | cuBLAS dense matmul | Speedup |
+|:---:|:---:|:---:|:---:|
+| 64 | 0.070 ms | 0.470 ms | **6.71×** |
+| 128 | 0.070 ms | 0.535 ms | **7.67×** |
+| 256 | 0.071 ms | 0.637 ms | **9.00×** |
 
-| Test | Result |
-|------|--------|
-| Single needle (512-131k tokens) | **PASS** at all lengths |
-| 5-needle at near-max context | **5/5** retrieved |
-| 3-needle multi-fact coherence | **3/3** retrieved |
-| Golden ratio completion (all lengths) | **PASS**, perplexity 1.05-1.35 |
-| Math reasoning at max context | Coherent (model math error from pruning, not context) |
+Benchmark: 4096-row batch, float32, RTX A4000, 200 repeats after warmup. The
+Python butterfly takes 62.8 ms for a single 256-row call — a ~900× speedup.
 
-#### TQ Quantization Quality (head_dim=256, measured on GPU)
+Correctness validated against a Sylvester-constructed Hadamard matrix:
+max reconstruction error ~1e-7 across d ∈ {64, 128, 256} (float32 noise floor).
 
-| Component | cos_sim | Notes |
-|-----------|--------:|-------|
-| TQ key compression (3-bit) | **1.000000** | Near-lossless |
-| TQ key compression (4-bit) | **1.000000** | Near-lossless |
-| Value quantization (2-bit) | 0.940 | Bottleneck for quality |
-| Value quantization (4-bit) | 0.997 | Recommended for quality-sensitive use |
-| Combined (3b key + 2b val) | 0.940 | Value quant dominates degradation |
+---
 
-#### GPU Utilization During Inference
+## Quickstart
 
-| Context | Peak VRAM/GPU | GPU Util | CPU % | Power |
-|--------:|--------------:|---------:|------:|------:|
-| 1,000 | 22,284 MB | 0% idle | 0.2% | 132W |
-| 32,000 | 22,286 MB | 57% peak | 0.4% | 142W |
-| 131,000 | 22,306 MB | 0% idle | 0.4% | 130W |
+```bash
+pip install -e .
+```
 
-- VRAM is **essentially flat** -- KV cache at 131k is only 190 MB/GPU (0.8% of VRAM).
-- No CPU offloading. No KV offloading. Everything fits in VRAM.
-- GPU interconnect is **PCIe** (no NVLink) -- NODE topology between all GPUs.
+Requirements: Python 3.10+, PyTorch 2.10+, Triton 3.6+, CUDA 12.x.
 
-### Paper Validation (Theorems 1-3)
+### Reproduce the paper
 
-9 tests validating the paper's theoretical claims:
+```bash
+# Value quantization quality sweep (Table 1 in paper)
+python exp_a_values.py
 
-| Claim | Verdict | Details |
-|-------|---------|---------|
-| MSE distortion bounds (Thm 1) | **PASS** | Within bounds for unit-norm vectors |
-| Codebook MSE matches Table 1 | **PASS** | Lloyd-Max codebook is faithful |
-| Unbiasedness (Thm 2) | **PASS** | Relative bias < 0.1% |
-| Distortion 1/4^b scaling (Thm 3) | **PASS** | 2-bit=0.70x, 3-bit=0.82x, 4-bit=0.97x of bound |
-| Recall@8 (3-bit, N=4096) | **0.55** | Paper threshold met (>=0.40) |
-| Rank correlation (N=2048) | **PASS** | Spearman rho > 0.85 |
-| Needle retrieval | **PASS** | Works at all SNR levels |
-| Compression ratio | **4.41x** | At head_dim=256 on full-attention layers |
+# RHT vs QR rotation equivalence (Table 4 in paper)
+python exp_b_hadamard.py
 
-### Adversarial Audit
+# Fused decode correctness + throughput (Tables 2, 3 in paper)
+python exp_c_fused.py
 
-Honest assessment of claims (see `audit_claims.py` for full data):
+# Triton WHT kernel correctness test
+python -c "from turboquant.wht_kernel import test_rht_correctness; \
+           print('PASS' if test_rht_correctness() else 'FAIL')"
+```
 
-| Claim | Verdict |
-|-------|---------|
-| "5.1x compression" | **Misleading** -- doesn't count Pi/S matrices or ring buffer. Honest: ~4.6x at 4k tokens, ~5x at 32k+ |
-| "Needle-in-haystack passes" | **True but trivial** -- query=key test is too easy. Real LLM queries are not copies of keys |
-| "Recall@8 >= 0.40" | **Low bar** -- 3-bit recall@1 is only 38%. BUT dominant attention tokens are always preserved |
-| "Hybrid decode saves memory" | **Storage yes, compute no** -- dequantizes all history to float32 per decode step |
-| "Distortion follows 1/4^b" | **True** -- initial audit was wrong (unnormalized vectors). Unit-norm: within bound |
-| "30k TQ is faster" | **Within noise** -- N=1 run, total wall time TQ is actually slower |
-| "200k context works" | **Unverified** -- didn't crash, but output quality never checked |
-| "2x context on dense model" | **True** -- measured 30 GB freed on Qwen3.5-27B with 4x RTX 3090 |
+Each script is self-contained and runs in under 5 minutes on an RTX A4000.
 
-## How It Works
+---
 
-TurboQuant compresses KV cache entries using:
-1. **Random orthogonal rotation** to spread information across dimensions
-2. **Lloyd-Max optimal scalar quantization** (b-1 bits) on Beta-distributed rotated values
-3. **QJL projection** for residual sign bits (1 bit per dimension)
-4. **Group quantization** for values (2-bit or 4-bit, per-group scales and zeros)
-5. **Bit-packing**: 4 values per byte (2-bit) or 2 per byte (4-bit)
+## Results detail
 
-The combined estimator is **unbiased**: E[estimated inner product] = true inner product.
+### Fused decode correctness (`exp_c_fused.py`)
+
+All 9 configurations pass with max_err=0 and cosine=1.0 against a hybrid
+reference (Triton attention scoring + PyTorch softmax + dequantized values):
+
+```
+  BH= 8 N=  256 D=128 vbits=2 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH=16 N= 1024 D=128 vbits=2 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH=16 N= 1024 D=256 vbits=2 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH=32 N= 4096 D=128 vbits=2 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH= 8 N=  256 D=128 vbits=3 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH=16 N= 1024 D=128 vbits=3 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH=16 N= 1024 D=128 vbits=3 gs=16  max_err=0.00000  cos=1.000000  PASS
+  BH=16 N= 1024 D=256 vbits=3 gs=32  max_err=0.00000  cos=1.000000  PASS
+  BH=32 N= 4096 D=128 vbits=3 gs=32  max_err=0.00000  cos=1.000000  PASS
+```
+
+The 3-bit value configurations are new in this branch and validate the
+`unpack_values` bits=3 branch added in
+[`docs/07_kernel3_3bit_fix.md`](docs/07_kernel3_3bit_fix.md).
+
+### Fused decode throughput (BH=32, D=128, 100 repeats)
+
+| Context (N) | FP16 baseline | Hybrid (Triton scores + PyTorch) | Fused (Triton) |
+|:---:|:---:|:---:|:---:|
+| 256 | 0.133 ms | 0.484 ms | 0.340 ms |
+| 1,024 | 0.254 ms | 0.457 ms | 0.345 ms |
+| 4,096 | 0.896 ms | 1.616 ms | 1.081 ms |
+| 16,384 | 3.453 ms | 6.401 ms | 4.334 ms |
+
+See the [honest caveats](#limitations-and-honest-caveats) section for how to
+read these numbers — on the A4000 the fused kernel is slower than FP16 in wall
+time. TurboQuant+'s win on this hardware is **memory extension**, not raw
+decode latency.
+
+### Context capacity (RTX A4000, 16.8 GB, 32 heads)
+
+| Config | Bytes/token | Max context | Extension vs FP16 |
+|---|:---:|:---:|:---:|
+| FP16 baseline | 512 | 615 k | 1.00× |
+| 3-bit keys + 2-bit values (gs=32) | 132 | **2,386 k** | **3.88×** |
+| 3-bit keys + 3-bit values (gs=32) | 148 | 2,130 k | 3.46× |
+| 3-bit keys + 4-bit values (gs=32) | 164 | 1,920 k | 3.12× |
+
+From `exp_c_fused.py`, assuming 60% of VRAM allocated to KV cache.
+
+---
+
+## Comparison to upstream TurboQuant
+
+The upstream README (on the `main` branch of
+[0xSero/turboquant](https://github.com/0xSero/turboquant)) documents a vLLM
+integration with end-to-end inference benchmarks:
+
+- **RTX 5090 (32 GB)** — Qwen3.5-27B-AWQ, TP=1, vLLM 0.18.0: +5.7 % prefill,
+  +3.1 % decode, 30 GB KV freed, 2.0× token capacity.
+- **8× RTX 3090 (24 GB)** — Qwen3.5-35B-A3B MoE, TP=8: 30.9 % KV savings
+  across the 10 full-attention layers, 1.45× context extension.
+
+Those benchmarks require the upstream integration scripts
+(`validate_paper.py`, `validate_moe*.py`, `profile_100k.py`, etc.) and models
+that live on the upstream main branch. **They are not reproducible on this
+branch** and are not the focus of TurboQuant+. This branch validates the three
+algorithmic improvements in isolation on commodity hardware; production
+integration work is upstream.
+
+Specific upstream claims, revisited:
+
+| Upstream statement | TurboQuant+ |
+|---|---|
+| *"Value quantization is the bottleneck: 2-bit values cause cos_sim=0.94 degradation."* | Confirmed — and addressed. At the same 64 B/token budget, 3-bit gs=32 reaches cos=0.986. |
+| *"Hybrid decode dequantizes all history per decode step."* | Kernel 3 (`turboquant_fused_decode`) now validated end-to-end with both 2-bit and 3-bit values; no full-history dequant on the fast path. |
+| *"200–400× faster than Python butterfly"* (WHT docstring) | Measured on A4000: ~900× vs Python, 6.71–9.00× vs cuBLAS dense matmul. |
+| *"Value quant 2-bit: cos_sim 0.940"* (head_dim=256) | Consistent with our d=128 measurement of 0.9329 (2-bit gs=32) — upstream uses a different metric. TurboQuant+ raises this to 0.986 at the same budget. |
+
+---
 
 ## Architecture
 
 ```
 turboquant/
-  codebook.py          # Lloyd-Max optimal scalar quantizer for Beta distribution
-  codebooks/           # Pre-generated codebook files (d=128/256, bits 2/3/4)
-  rotation.py          # Random orthogonal rotation + QJL projection matrices
-  quantizer.py         # TurboQuantMSE + TurboQuantProd (Algorithms 1 & 2)
-  kv_cache.py          # KV cache manager with value bit-packing
-  capture.py           # Modular KV capture hooks for attention layers
-  store.py             # Compressed KV store (quantize + append + flat cache)
-  score.py             # Attention scoring from compressed keys
-  integration/vllm.py  # vLLM adapter (monkey-patch, free_kv_cache, hybrid decode)
-  triton_kernels.py    # 3 fused Triton kernels for decode attention
-  vllm_attn_backend.py # Thin shim delegating to integration/vllm.py
+  codebook.py        Lloyd-Max optimal scalar quantizer for Beta distribution
+  codebooks/         Pre-generated codebooks (d=128/256, bits 1..4)
+  rotation.py        Legacy QR rotation + QJL projection matrices
+  wht_kernel.py      Triton WHT + RHTRotation (102× less memory than QR)
+  quantizer.py       TurboQuantMSE + TurboQuantProd (paper Algorithms 1 & 2)
+  kv_cache.py        Value bit-packing (2/3/4/8-bit, group-asymmetric)
+  triton_kernels.py  Three fused Triton kernels for decode attention
 
-validate_paper.py      # 9 tests validating Theorems 1-3
-audit_claims.py        # Adversarial audit of all claims
-test_modular.py        # 19 modular architecture tests
-test_turboquant.py     # 7 core quantizer tests
-proof.py               # A/B benchmark (baseline vs TQ)
+docs/
+  00_codebase_overview.md       Repo tour
+  01..05_experiment_*.md        Per-experiment design notes
+  06_improvements_shipped.md    Quality deltas and diffs
+  07_kernel3_3bit_fix.md        3-bit fused-kernel enablement
+  08_wht_kernel.md              Triton WHT design and benchmarks
 
-# Profiling scripts (8x RTX 3090 MoE validation)
-validate_moe.py        # Baseline measurements via vLLM API
-validate_moe_phase2.py # TQ quality on real GPU with head_dim=256
-validate_moe_phase3.py # Logprobs, multi-needle, reasoning at max context
-profile_100k.py        # Full profiling at 1k-131k context
-profile_large.py       # Large context (64k-131k) with file-based payloads
-baseline_vs_tq.py      # VRAM comparison: baseline bf16 vs TQ compressed
-baseline_vs_tq_v2.py   # Block-level measurement during inference
+paper/
+  turboquant_plus_v2.tex        Paper draft
+  research_brief.md             Single-page summary
+  neurips.sty, extra_pkgs.tex   Style
+
+exp_a_values.py       Value quantization quality sweep
+exp_b_hadamard.py     RHT vs QR rotation equivalence
+exp_c_fused.py        Fused decode correctness + throughput
 ```
 
-## Usage
+---
 
-```bash
-pip install -e .
+## Limitations and honest caveats
 
-# Run paper validation (CPU, no GPU needed)
-python validate_paper.py
+1. **All quality numbers are on synthetic Gaussian inputs.** `exp_a_values.py`
+   samples from `torch.randn`. Real KV tensors from trained models have
+   channel-wise outlier structure ([SmoothQuant](https://arxiv.org/abs/2211.10438))
+   that can degrade group-quantization quality beyond what Gaussian inputs
+   suggest. The paper acknowledges this explicitly (Section 6, Limitations).
+   End-to-end PPL on a real model is the next validation milestone.
 
-# Run adversarial audit
-python audit_claims.py
+2. **The 7.67× WHT speedup is vs cuBLAS dense matmul, not a hand-tuned QR
+   implementation.** cuBLAS is the natural comparison for "how QR would be
+   implemented in practice," but a specialized QR kernel would close part of
+   the gap. The claim is that WHT is competitive with the best available
+   dense-matmul alternative, not maximally faster than any possible baseline.
 
-# Run modular tests
-python -m pytest test_modular.py -v
+3. **Fused decode on RTX A4000 is slower than FP16 baseline** (0.3–0.8× of
+   FP16 wall time across N=256..16384). The A4000 has strong FP16 tensor cores
+   that dominate the comparison on this hardware. TurboQuant+'s value on the
+   A4000 is the 3.88× memory extension, not raw decode speed. Upstream's 5.7 %
+   prefill / 3.1 % decode wins are on RTX 5090 under a different workload.
 
-# Run proof benchmark (requires 4x RTX 3090 + Qwen3.5-27B-AWQ)
-CUDA_VISIBLE_DEVICES=0,1,4,6 python proof.py
+4. **No inference-quality numbers yet** (PPL, MMLU, HumanEval). The
+   contribution is algorithmic: we show cosine-similarity quality improvements
+   on the quantization path itself. Demonstrating that these translate into
+   end-task quality wins requires integration with a real inference stack and
+   is left to upstream or future work.
+
+5. **RHT requires d to be a power of 2**. The kernel supports d ∈ {16, 32, 64,
+   128, 256, 512}. Non-power-of-2 head dimensions require zero-padding, which
+   the RHTRotation class handles but at non-lossless inverse accuracy.
+
+6. **Correctness claims apply to the shipped code as of commit `2c976f6`.**
+   The Triton WHT kernel has three bugs fixed on this branch (butterfly sign,
+   cross-warp barrier, constexpr sqrt — see commit `4c8d571`); earlier commits
+   of this branch do not pass `test_rht_correctness` for d ≥ 128.
+
+---
+
+## Citation
+
+Upstream TurboQuant paper:
+
+```bibtex
+@misc{zandieh2025turboquant,
+  title         = {TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate},
+  author        = {Zandieh, Amir and Daliri, Majid and Hadian, Majid and Mirrokni, Vahab},
+  year          = {2025},
+  eprint        = {2504.19874},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2504.19874}
+}
 ```
 
-## Test Results
+TurboQuant+ (this repository) — citation pending paper submission; in the
+meantime, see [`paper/turboquant_plus_v2.tex`](paper/turboquant_plus_v2.tex).
 
-All 35 tests pass:
-- `test_modular.py`: 19/19 (modular architecture)
-- `test_turboquant.py`: 7/7 (core quantizer)
-- `validate_paper.py`: 9/9 (paper theorem validation)
-
-## Limitations
-
-- **Prefill still uses paged cache**: KV cache is allocated at engine init and used during prefill. TQ frees it after. True zero-allocation requires deeper vLLM integration.
-- **Only full-attention layers**: Linear-attention/Mamba layers are not compressed.
-- **Value quantization is the bottleneck**: 2-bit values cause cos_sim=0.94 degradation. Use 4-bit values (cos_sim=0.997) for quality-sensitive workloads.
-- **Hybrid decode dequantizes all history**: During compute, all compressed tokens are expanded to float32. The paper's fused Triton kernels exist but the hybrid path doesn't use them yet.
-- **MoE models benefit less**: Models with linear-attention layers (Qwen3.5 MoE, Mamba hybrids) have incompressible state that limits TQ's overall impact.
+---
 
 ## Environment
 
-Tested on:
-- vLLM 0.18.0, PyTorch 2.10, CUDA 12.8
-- RTX 5090 (32GB) -- Qwen3.5-27B-AWQ, single GPU
-- 8x RTX 3090 (24GB) -- Qwen3.5-35B-A3B MoE, TP=8
-- Python 3.12
+Validation hardware:
+
+- NVIDIA RTX A4000, 16 GB, compute capability 8.6, CUDA 12.8
+- Ubuntu 22.04 (Shadeform / Brev cloud GPU instance)
+- Python 3.10, PyTorch 2.11.0+cu128, Triton 3.6.0
