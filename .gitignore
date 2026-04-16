@@ -11,3 +11,18 @@ build/
 *.log
 /tmp/
 test-output/
+
+# Paper build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.out
+paper/*.toc
+paper/*.pdf
+
+# Triton cache
+~/.triton/
+.triton/
