@@ -21,7 +21,7 @@ paper/*.fdb_latexmk
 paper/*.synctex.gz
 paper/*.out
 paper/*.toc
-paper/*.pdf
+
 
 # Triton cache
 ~/.triton/
