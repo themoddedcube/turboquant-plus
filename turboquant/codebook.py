@@ -179,3 +179,72 @@ def get_codebook_tensors(d: int, bits: int, device: torch.device, dtype: torch.d
     centroids = torch.tensor(cb["centroids"], device=device, dtype=dtype)
     boundaries = torch.tensor(cb["boundaries"], device=device, dtype=dtype)
     return centroids, boundaries
+
+
+# ── QJL scale calibration ─────────────────────────────────────────────────
+#
+# The fixed-α decode r̂ = (α/d) · ||r|| · Sᵀ · sign(S·r) uses α = sqrt(π/2),
+# the unbiased coefficient under the iid-Gaussian residual assumption. Once
+# the centroid table is retuned, the residual distribution changes shape and
+# that α miscalibrates. calibrate_qjl_scale fits α directly to the empirical
+# residuals.
+#
+# Closed-form MSE-min α (minimizes Σ‖r_i − (α/d)·‖r_i‖·g_i‖² over samples i,
+# matching the codec's decoder r̂ = (α/d)·‖r‖·Sᵀ·sign(S·r)):
+#     α* = d · Σ[‖r_i‖·⟨r_i, g_i⟩] / Σ[‖r_i‖²·‖g_i‖²]
+# where g_i = Sᵀ · sign(S · r_i). This aggregates additively across samples
+# and converges to its analytic value with a few hundred samples.
+# Equivalent forms: for unit-normalized residuals u_i = r_i/‖r_i‖ the inner
+# product simplifies to ⟨u, g⟩, and for homoscedastic ‖r‖ the formula
+# reduces to d · Σ⟨u,g⟩ / Σ‖g‖² up to a constant rescale.
+#
+# Cos-max α (maximizes whole-vector cos(x, x̃_mse + (α/d)·g)) has no closed
+# form — it's rational in α per sample. Use a 1D search (e.g. golden section)
+# if cosine similarity is the downstream metric. Not implemented here; the
+# MSE-min closed form is the principled placeholder.
+
+
+def calibrate_qjl_scale(
+    residuals: "torch.Tensor",
+    qjl_matrix: "torch.Tensor",
+) -> float:
+    """
+    Closed-form MSE-min α for the QJL residual decoder.
+
+    Args:
+        residuals: (..., d) tensor of residuals r_i = x_i - x̃_mse_i,
+                   measured in the *rotated* frame (post-Π, pre-codebook).
+                   Any leading batch dims are flattened.
+        qjl_matrix: (d, d) random projection S (must match the S installed
+                    in TurboQuantProd — same seed).
+
+    Returns:
+        α* (the bare scalar; divide by d at the call site, as TurboQuantProd
+        does). Sign convention follows the codec: sign = +1 when S·r > 0,
+        −1 otherwise (zero ties go to −1 — see quantizer._pack_qjl_signs).
+    """
+    if residuals.ndim < 2:
+        raise ValueError(f"residuals must have shape (..., d); got {tuple(residuals.shape)}")
+    d = residuals.shape[-1]
+    if qjl_matrix.shape != (d, d):
+        raise ValueError(
+            f"qjl_matrix has shape {tuple(qjl_matrix.shape)}, expected ({d}, {d})"
+        )
+
+    r = residuals.reshape(-1, d).to(torch.float32)
+    S = qjl_matrix.to(device=r.device, dtype=torch.float32)
+
+    proj = r @ S.T                                    # (n, d)
+    signs = torch.where(proj > 0, 1.0, -1.0)          # matches _pack_qjl_signs (zero → −1)
+    g = signs @ S                                     # (n, d) — Sᵀ · sign(S · r)
+
+    r_norm = r.norm(dim=-1)                           # (n,)
+    rg = (r * g).sum(dim=-1)                          # (n,) — ⟨r_i, g_i⟩
+    gg = (g * g).sum(dim=-1)                          # (n,) — ‖g_i‖²
+
+    num = (r_norm * rg).sum().item()                  # Σ ‖r_i‖·⟨r_i, g_i⟩
+    den = (r_norm * r_norm * gg).sum().item()         # Σ ‖r_i‖²·‖g_i‖²
+    if den <= 0.0:
+        raise ValueError("degenerate calibration: Σ‖r‖²·‖g‖² is zero")
+
+    return float(d) * num / den

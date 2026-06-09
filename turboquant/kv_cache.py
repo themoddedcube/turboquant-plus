@@ -171,6 +171,9 @@ class TurboQuantKVCache:
         device: torch.device = None,
         dtype: torch.dtype = torch.float16,
         layer_idx: int = 0,
+        key_centroids: Optional[torch.Tensor] = None,
+        key_boundaries: Optional[torch.Tensor] = None,
+        key_qjl_scale: Optional[float] = None,
     ):
         self.head_dim = head_dim
         self.key_bits = key_bits
@@ -186,6 +189,9 @@ class TurboQuantKVCache:
             bits=key_bits,
             device=self.device,
             seed=42 + layer_idx * 7,
+            centroids=key_centroids,
+            boundaries=key_boundaries,
+            qjl_scale=key_qjl_scale,
         )
 
         # State

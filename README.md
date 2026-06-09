@@ -83,6 +83,36 @@ Python butterfly takes 62.8 ms for a single 256-row call — a ~900× speedup.
 Correctness validated against a Sylvester-constructed Hadamard matrix:
 max reconstruction error ~1e-7 across d ∈ {64, 128, 256} (float32 noise floor).
 
+### 4. Overridable QJL scale + per-table calibration
+
+The decoder constant α (default `sqrt(π/2)`, baked into upstream as the
+unbiased coefficient under iid-Gaussian residuals) is now a constructor
+knob on both `TurboQuantProd` and `TurboQuantKVCache`. Centroid tables
+are likewise overridable, so a per-layer Lloyd-Max retune can ship as a
+coupled `(centroids, boundaries, qjl_scale)` artefact.
+
+```python
+from turboquant.codebook import calibrate_qjl_scale
+from turboquant.kv_cache import TurboQuantKVCache
+
+# Calibrate MSE-min α on captured rotated residuals.
+alpha = calibrate_qjl_scale(residuals, S)  # bare α; ~0.4875 on Gaussian at d=64
+
+cache = TurboQuantKVCache(
+    head_dim=128, key_bits=3,
+    key_centroids=retuned_centroids,
+    key_boundaries=retuned_boundaries,
+    key_qjl_scale=alpha,
+)
+```
+
+`qjl_scale=None` (default) preserves bit-exact prior behaviour. Closed
+form: `α* = d · Σ[‖r‖·⟨r,g⟩] / Σ[‖r‖²·‖g‖²]` where `g = Sᵀ·sign(S·r)`.
+Design rationale and the MSE-min vs cos-max α discussion live in
+[`paper/turboquant_research_notes.md`](paper/turboquant_research_notes.md);
+verification gates in `tests/test_qjl_calibration.py` (8/8 passing,
+including a Gaussian-residual analytic check at d=64).
+
 ---
 
 ## Quickstart
@@ -197,13 +227,16 @@ Specific upstream claims, revisited:
 
 ```
 turboquant/
-  codebook.py        Lloyd-Max optimal scalar quantizer for Beta distribution
+  codebook.py        Lloyd-Max optimal scalar quantizer + calibrate_qjl_scale
   codebooks/         Pre-generated codebooks (d=128/256, bits 1..4)
   rotation.py        Legacy QR rotation + QJL projection matrices
   wht_kernel.py      Triton WHT + RHTRotation (102× less memory than QR)
-  quantizer.py       TurboQuantMSE + TurboQuantProd (paper Algorithms 1 & 2)
+  quantizer.py       TurboQuantMSE + TurboQuantProd (overridable centroids/α)
   kv_cache.py        Value bit-packing (2/3/4/8-bit, group-asymmetric)
   triton_kernels.py  Three fused Triton kernels for decode attention
+
+tests/
+  test_qjl_calibration.py   Override + MSE-min calibration gates
 
 docs/
   00_codebase_overview.md       Repo tour

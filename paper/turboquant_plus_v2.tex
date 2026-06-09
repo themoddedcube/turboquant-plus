@@ -117,7 +117,7 @@ TurboQuantProd estimates $\langle \bm{q}, \bm{k} \rangle$ via two stages:
 \[
 \hat{s} = \underbrace{\hat{s}_\text{MSE}}_{\text{(b-1)-bit centroid dot}} + \underbrace{\hat{s}_\text{QJL}}_{\text{1-bit residual sign correction}}
 \]
-This satisfies $\Eop[\hat{s}] = \langle \bm{q}, \bm{k} \rangle$—provably unbiased.
+The QJL term decodes the residual $\bm{r} = \bm{k} - \hat{\bm{k}}_\text{MSE}$ as $\hat{\bm{r}} = (\alpha/d) \cdot \|\bm{r}\| \cdot S^\top \mathrm{sign}(S\bm{r})$, where $S \in \R^{d \times d}$ has iid $\mathcal{N}(0,1)$ entries and the scale $\alpha = \sqrt{\pi/2}$ is the unbiased coefficient $1/\Eop[|z|]$ for $z \sim \mathcal{N}(0,1)$. Under iid-Gaussian residuals this satisfies $\Eop[\hat{s}] = \langle \bm{q}, \bm{k} \rangle$—provably unbiased. The Gaussian assumption is an engineering choice baked into the upstream codec; \S\ref{sec:discussion} discusses when it breaks and how this branch exposes $\alpha$ as a calibratable knob.
 
 \subsection{Value Quantization: The Bottleneck}
 \label{sec:value_bottleneck}
@@ -251,7 +251,7 @@ FP16 & — & 1.000 & 256 & Baseline \\
 \addplot[black, dashed, thick, mark=none] coordinates {(44, 1.0)(105, 1.0)};
 \addlegendentry{FP16}
 % Annotation
-\node[font=\tiny, red, above right] at (64, 0.986) {3-bit gs=32\\\textbf{+0.034}};
+\node[font=\tiny, red, above right, align=left] at (64, 0.986) {3-bit gs=32\\\textbf{+0.034}};
 \node[font=\tiny, blue, above right] at (64, 0.952) {2-bit gs=16};
 \end{axis}
 \end{tikzpicture}
@@ -386,6 +386,13 @@ At $N \leq 16{,}384$, Kernel 3 is 1.2$\times$ slower than FP16 cuBLAS decode. Th
 (i) \textit{Synthetic evaluation}: all results use Gaussian random vectors. Real model activations have outlier structure \citep{xiao2023smoothquant} that may degrade 2-bit quality more than our results suggest. We attempted per-channel max-abs normalization (SmoothQuant) but found it slightly degraded cosine similarity ($-0.003$) on Gaussian inputs; results on real activations remain to be measured.
 (ii) \textit{No end-to-end perplexity}: we use cosine similarity as a proxy for generation quality. True perplexity on Wikitext-103/C4 with patched TurboQuant via vLLM is outside our current compute budget.
 (iii) \textit{3-bit values not yet in fused Kernel 3}: the Python wrapper dispatches 3-bit to the CPU unpack path before entering the Triton kernel. A native 3-bit decode path in the Triton kernel would eliminate this host-device transfer.
+
+\textbf{Per-layer QJL scale calibration.}
+The QJL decoder constant $\alpha = \sqrt{\pi/2}$ is the unbiased coefficient under iid-Gaussian residuals (\S\ref{sec:turboquant}). Any per-layer centroid retune shifts the residual distribution and miscalibrates this default. We expose $\alpha$ as a constructor knob on \texttt{TurboQuantProd} / \texttt{TurboQuantKVCache} and provide a closed-form MSE-min calibrator in \texttt{turboquant.codebook.calibrate\_qjl\_scale}. Fitting the codec's decoder $\hat{\bm{r}} = (\alpha/d) \|\bm{r}\| \bm{g}$ with $\bm{g} = S^\top \mathrm{sign}(S\bm{r})$ over a set of captured residuals admits
+\[
+\alpha^*_{\mathrm{MSE}} = d \cdot \frac{\sum_i \|\bm{r}_i\| \langle \bm{r}_i, \bm{g}_i \rangle}{\sum_i \|\bm{r}_i\|^2 \|\bm{g}_i\|^2},
+\]
+which at finite $d=64$ for iid Gaussians evaluates to $\sqrt{2/\pi} / (1 + 2/\pi) \approx 0.4875$—distinct from the unbiased $\sqrt{\pi/2} \approx 1.2533$. The MSE-min vs unbiased gap shrinks as $d \to \infty$. Cosine-similarity-optimal $\alpha$ has no closed form (rational in $\alpha$ per sample) and requires a 1D search; we leave the empirical comparison of MSE-min vs cosine-max $\alpha$ on real captures to future work. With this knob, per-layer codebook retunes can ship as a coupled $(\text{centroids}, \text{boundaries}, \alpha)$ artefact without disturbing the default code path.
 
 % ─── 8. Related Work ────────────────────────────────────────────────────────
 

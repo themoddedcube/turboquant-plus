@@ -105,6 +105,8 @@ class TurboQuantMSE(torch.nn.Module):
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
+        centroids: Optional[torch.Tensor] = None,
+        boundaries: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -117,8 +119,23 @@ class TurboQuantMSE(torch.nn.Module):
             "Pi", generate_rotation_matrix(dim, self.device, dtype, seed=seed)
         )
 
-        # Precompute codebook
-        centroids, boundaries = get_codebook_tensors(dim, bits, self.device, dtype)
+        # Codebook — default Lloyd-Max for the Beta(d) distribution, or an
+        # externally supplied retune (e.g. fit on per-layer captured residuals).
+        if centroids is None or boundaries is None:
+            if centroids is not None or boundaries is not None:
+                raise ValueError("centroids and boundaries must be provided together")
+            centroids, boundaries = get_codebook_tensors(dim, bits, self.device, dtype)
+        else:
+            if centroids.numel() != self.n_clusters:
+                raise ValueError(
+                    f"centroids has {centroids.numel()} entries, expected 2**bits = {self.n_clusters}"
+                )
+            if boundaries.numel() != self.n_clusters + 1:
+                raise ValueError(
+                    f"boundaries has {boundaries.numel()} entries, expected 2**bits + 1 = {self.n_clusters + 1}"
+                )
+            centroids = centroids.to(device=self.device, dtype=dtype).contiguous()
+            boundaries = boundaries.to(device=self.device, dtype=dtype).contiguous()
         self.register_buffer("centroids", centroids)      # (2^b,)
         self.register_buffer("boundaries", boundaries)    # (2^b + 1,)
 
@@ -190,6 +207,9 @@ class TurboQuantProd(torch.nn.Module):
         device: torch.device = None,
         dtype: torch.dtype = torch.float32,
         seed: int = 42,
+        centroids: Optional[torch.Tensor] = None,
+        boundaries: Optional[torch.Tensor] = None,
+        qjl_scale: Optional[float] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -200,7 +220,8 @@ class TurboQuantProd(torch.nn.Module):
 
         # Stage 1: MSE quantizer at (b-1) bits
         self.mse_quantizer = TurboQuantMSE(
-            dim=dim, bits=bits - 1, device=self.device, dtype=dtype, seed=seed
+            dim=dim, bits=bits - 1, device=self.device, dtype=dtype, seed=seed,
+            centroids=centroids, boundaries=boundaries,
         )
 
         # Stage 2: QJL projection matrix S ∈ R^{d×d}
@@ -208,8 +229,15 @@ class TurboQuantProd(torch.nn.Module):
             "S", generate_qjl_matrix(dim, self.device, dtype, seed=seed + 1000)
         )
 
-        # QJL dequantization constant
-        self.qjl_scale = math.sqrt(math.pi / 2.0) / dim
+        # QJL dequantization constant α/d. Default α = sqrt(π/2) is the
+        # unbiased coefficient under the iid-Gaussian residual assumption
+        # (E[|z|] = sqrt(2/π) for z ~ N(0,1)). Pass qjl_scale to override
+        # with a value calibrated against a retuned codebook — see
+        # codebook.calibrate_qjl_scale.
+        if qjl_scale is None:
+            self.qjl_scale = math.sqrt(math.pi / 2.0) / dim
+        else:
+            self.qjl_scale = float(qjl_scale) / dim
 
     def _pack_qjl_signs(self, projected: torch.Tensor) -> torch.Tensor:
         """Pack sign bits into uint8 (8 signs per byte)."""
