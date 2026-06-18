@@ -159,6 +159,18 @@ class TurboQuantKVCache:
         # Compute attention:
         scores = cache.attention_scores(query_states)
         output = cache.attend(query_states, scores_after_softmax)
+
+    Scope caveat — uniform low-bit only on GQA:
+        This codec is designed and validated for *uniform* low-bit value
+        quantization (strong per-token reconstruction cosine, fast kernels),
+        especially on MHA. Do NOT drive it with a per-token adaptive-precision
+        controller (e.g. DWB-style importance routing) on a grouped-query-
+        attention model. The key rotation delocalizes each token's quantization
+        error across the whole head dim, so per-token protection cannot remove
+        it, and GQA's KV sharing amplifies the residual across query heads;
+        task accuracy fails to recover even with a 50%-lossless oracle. For
+        adaptive precision on GQA, use scalar-INT tiers {4,8,16} (drop 2-bit)
+        instead of this codec. See docs/09_gqa_per_token_limitation.md.
     """
 
     def __init__(

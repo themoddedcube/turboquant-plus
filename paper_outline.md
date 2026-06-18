@@ -195,13 +195,15 @@ Speed: RHT Python loop 200x slower; Triton WHT would be ~10x faster than cuBLAS
 
 6.4 Limitations
 - Tested on random Gaussian vectors; real model activations have outlier structure
-- No end-to-end perplexity measurement (requires full vLLM setup)
+- Cosine similarity does not predict task accuracy under per-token adaptive precision on GQA (HellaSwag study, doc 09): the rotated codec fails to recover accuracy under a per-token bit-width controller on Qwen2-0.5B (0.348 vs 0.420 FP16), while a scalar-INT tiering recovers (0.412–0.416). Rotation delocalizes per-token error; GQA's 7:1 KV sharing amplifies it. Scope boundary — does not contradict the uniform-codec cosine results.
+- No full end-to-end perplexity measurement (requires full vLLM setup)
 - SmoothQuant evaluation incomplete
 
 6.5 Future Work
 - Triton WHT kernel for O(d log d) rotation
 - 3-bit value integration into fused Kernel 3
 - Per-layer adaptive bit allocation
+- Localized/blockwise rotation that keeps the low-bit edge AND per-token protectability on GQA (open codec-revision question from doc 09)
 - Evaluation on Llama-3, Qwen3, Gemma on real text benchmarks
 
 ### 7. Conclusion (~200 words)

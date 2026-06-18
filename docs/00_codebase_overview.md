@@ -149,6 +149,7 @@ Kernel 3 implements flash-attention style online softmax over compressed KV — 
 | 5 | **Prefill memory** | KV allocated at engine init, not zero-alloc | `vllm_attn_backend.py` |
 | 6 | **QJL high per-sample variance** | Individual score estimates noisy despite unbiasedness | `quantizer.py:TurboQuantProd` |
 | 7 | **Codebook is 1D scalar** | Independent per-coordinate quantization; could use vector quantization | `codebook.py`, `quantizer.py` |
+| 8 | **Rotation defeats per-token adaptive precision on GQA** | Task accuracy fails to recover under a per-token bit-width controller (0.348 vs 0.420 FP16); rotation delocalizes per-token error, GQA's 7:1 KV sharing amplifies it. Cosine stays high while accuracy collapses. Use scalar-INT tiers `{4,8,16}` for adaptive precision on GQA. | `docs/09_gqa_per_token_limitation.md`, `rotation.py`, `wht_kernel.py` |
 
 ---
 

@@ -127,6 +127,7 @@ FP16               | 512   | 615k    | 615k     | 1.00x
 3. Fused Kernel 3 is 1.2x slower than FP16 at N=16k — needs further tuning
 4. RHT speed advantage requires Triton WHT kernel (validated algorithm, not yet implemented)
 5. SmoothQuant evaluation incomplete — was slightly worse on Gaussian, may help on real activations
+6. **Cosine ≠ task accuracy under per-token adaptive precision on GQA (the big one).** Pairing the rotated vector codec with a per-token bit-width controller (DWB-style) fails to recover HellaSwag accuracy on Qwen2-0.5B (GQA): even an oracle keeping 50% of tokens lossless stays at 0.348 vs 0.420 FP16, while a scalar-INT tiering under identical routing recovers to 0.412–0.416. The rotation delocalizes per-token error across the head dim so protection can't catch it; GQA's 7:1 KV sharing amplifies it. The codec's headline cosine (0.986) stays high while task accuracy collapses. Scope boundary, not a contradiction of the uniform-codec results. Recipe for adaptive precision on GQA: learned controller → scalar-INT tiers {4,8,16} (drop 2-bit). Full writeup: `docs/09_gqa_per_token_limitation.md`.
 
 ---
 

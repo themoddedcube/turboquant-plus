@@ -300,6 +300,27 @@ Flag for later codec generations.
    per-coordinate-block α. Out of scope for this branch; flag for
    later.
 
+6. **Rotation vs per-token protectability on GQA (the big scope
+   boundary).** The rotation that makes this a strong *uniform* codec
+   delocalizes each token's quantization error across all `d` head-dim
+   coordinates. That is the *opposite* of what per-token adaptive
+   precision needs: when a controller protects "important" tokens and
+   compresses the rest, the smeared error from the compressed tokens
+   still corrupts the shared representation, and GQA's KV sharing (7:1
+   on Qwen2-0.5B) amplifies it across query heads. Result: pairing the
+   codec with a DWB-style per-token controller on GQA fails to recover
+   task accuracy (HellaSwag 0.348 even with a 50%-lossless oracle, vs
+   0.420 FP16), while a *scalar*-INT tiering under identical routing
+   recovers to 0.412–0.416 — the error stays token-local without the
+   rotation. Headline cosine (0.986) stays high throughout; the failure
+   is invisible to the reconstruction metric. Open codec-revision
+   question: can a **localized/blockwise rotation** (or skipping
+   rotation on the high-importance tiers) keep the uniform low-bit edge
+   *and* keep per-token error localized enough to protect on GQA? Full
+   elimination, mechanism, and reproduction in
+   `docs/09_gqa_per_token_limitation.md`. NOT in scope for the current
+   α / centroid override work; flag for later codec generations.
+
 ---
 
 ## 7. Pointers
@@ -329,4 +350,6 @@ Flag for later codec generations.
   that motivated C1/C2
 - `docs/05_experiment_fused_decode.md` — fused decode kernel that
   currently consumes `qjl_scale` as a `tl.constexpr` scalar
+- `docs/09_gqa_per_token_limitation.md` — negative result: rotated
+  codec + per-token adaptive precision fails on GQA (§6 Q6 above)
 - `paper/turboquant_plus_v2.tex` — published draft

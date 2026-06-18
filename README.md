@@ -26,6 +26,12 @@ reproducible from the scripts in this repository on an NVIDIA RTX A4000.
 The core result: **at the same 64 B/token budget, 3-bit gs=32 reaches cos=0.986
 vs 0.952 for 2-bit gs=16** — a +0.034 quality gain with zero storage cost.
 
+> **Scope.** These are *uniform* reconstruction-quality (cosine) numbers, where
+> TurboQuant+ is strong. They do **not** extend to per-token adaptive precision
+> on grouped-query-attention (GQA) models: there the rotation defeats per-token
+> protection and task accuracy fails to recover. See limitation #7 and
+> [`docs/09_gqa_per_token_limitation.md`](docs/09_gqa_per_token_limitation.md).
+
 ---
 
 ## What's new
@@ -244,6 +250,9 @@ docs/
   06_improvements_shipped.md    Quality deltas and diffs
   07_kernel3_3bit_fix.md        3-bit fused-kernel enablement
   08_wht_kernel.md              Triton WHT design and benchmarks
+  09_gqa_per_token_limitation.md  Negative result: do not pair the
+                                  rotated codec with per-token adaptive
+                                  precision on GQA (use scalar-INT tiers)
 
 paper/
   turboquant_plus_v2.tex        Paper draft
@@ -278,11 +287,16 @@ exp_c_fused.py        Fused decode correctness + throughput
    A4000 is the 3.88× memory extension, not raw decode speed. Upstream's 5.7 %
    prefill / 3.1 % decode wins are on RTX 5090 under a different workload.
 
-4. **No inference-quality numbers yet** (PPL, MMLU, HumanEval). The
-   contribution is algorithmic: we show cosine-similarity quality improvements
-   on the quantization path itself. Demonstrating that these translate into
-   end-task quality wins requires integration with a real inference stack and
-   is left to upstream or future work.
+4. **Cosine similarity is the headline metric, and it does not predict task
+   accuracy under per-token adaptive precision on GQA.** Every quality number
+   above is per-token reconstruction cosine on the quantization path itself —
+   not end-task accuracy. A task-accuracy study (HellaSwag on Qwen2-0.5B, a GQA
+   model — see [`docs/09_gqa_per_token_limitation.md`](docs/09_gqa_per_token_limitation.md))
+   found that cosine stays high (0.986 for 3-bit gs=32) while task accuracy
+   collapses once the codec is driven by a per-token importance controller on a
+   GQA model. Validate any adaptive-precision claim on task accuracy, not cosine
+   (or perplexity) alone. Full PPL/MMLU/HumanEval on a real inference stack
+   remains future work.
 
 5. **RHT requires d to be a power of 2**. The kernel supports d ∈ {16, 32, 64,
    128, 256, 512}. Non-power-of-2 head dimensions require zero-padding, which
@@ -292,6 +306,26 @@ exp_c_fused.py        Fused decode correctness + throughput
    The Triton WHT kernel has three bugs fixed on this branch (butterfly sign,
    cross-warp barrier, constexpr sqrt — see commit `4c8d571`); earlier commits
    of this branch do not pass `test_rht_correctness` for d ≥ 128.
+
+7. **Do not pair the rotated vector codec with per-token adaptive precision on
+   GQA models.** This is the largest known scope limitation. When TurboQuant+ is
+   driven by a per-token bit-width controller (e.g. *Don't Waste Bits!*-style
+   importance routing) on a grouped-query-attention model (Qwen2-0.5B: 2 KV
+   heads shared 7:1 across 14 query heads), task accuracy does **not** recover —
+   even an oracle that keeps 50% of tokens losslessly stays at uniform-codec
+   accuracy (0.348 vs 0.420 FP16 on HellaSwag). The cause is the rotation: the
+   RHT/WHT that makes this a great *uniform* low-bit codec spreads each token's
+   quantization error across all head-dim coordinates, so per-token protection
+   cannot localize and remove it, and GQA's 7:1 sharing amplifies the residual
+   across query heads. Swapping the rotated codec for a plain scalar-INT
+   quantizer under the *same* routing recovers to ≈ FP16 (0.412–0.416). The
+   working recipe for adaptive-precision KV compression on GQA is a learned
+   controller over **scalar-INT tiers `{4,8,16}` (drop the 2-bit tier)**, not
+   this codec. TurboQuant+ as shipped — uniform low-bit value quantization with
+   strong reconstruction and fast kernels, especially on MHA — is unaffected;
+   this limitation is specific to the per-token-adaptive-precision + GQA
+   combination. Full analysis, elimination, and mechanism in
+   [`docs/09_gqa_per_token_limitation.md`](docs/09_gqa_per_token_limitation.md).
 
 ---
 
